@@ -21,6 +21,10 @@ Extends the generic [nfc-forum-tags](../nfc-forum-tags) Type 2 Tag operations wi
 - Access control (PROT, CFGLCK, NFC_CNT_EN, NFC_CNT_PWD_PROT, AUTHLIM)
 - Per-variant page addresses (CFG0, CFG1, PWD, PACK, dynamic lock)
 
+### FAST_READ-Optimized Operations
+
+- **`read_ndef_fast`** — reads NDEF in 2 RF transactions: one READ to parse the TLV header (T+L), then a targeted FAST_READ of just the NDEF payload pages
+
 ### Delegated T2T Operations
 
 - READ / WRITE / SECTOR SELECT
@@ -52,6 +56,10 @@ let pack = reader.pwd_auth([0xFF, 0xFF, 0xFF, 0xFF])?;
 
 // Read ECC originality signature
 let sig = reader.read_sig()?;
+
+// Fast NDEF read: 1 READ (TLV header) + 1 FAST_READ (payload)
+let variant = version.variant().unwrap();
+let ndef = reader.read_ndef_fast(variant)?;
 
 // Standard T2T operations work too
 let ndef = reader.read_ndef()?;

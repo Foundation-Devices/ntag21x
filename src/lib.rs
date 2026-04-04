@@ -101,6 +101,101 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
         self.inner.set_max_retries(n);
     }
 
+    // ── FAST_READ-based alternatives ───────────────────────────────
+
+    /// Read the NDEF message using a targeted FAST_READ.
+    ///
+    /// 1. READ block 4 to parse the TLV header and discover the NDEF
+    ///    Message TLV length (T + L)
+    /// 2. FAST_READ only the pages covering the NDEF payload (V)
+    ///
+    /// This typically requires just 2 RF transactions (1 READ + 1
+    /// FAST_READ) regardless of NDEF size, compared to many READs in
+    /// [`read_ndef`](Self::read_ndef). The CC is read first for
+    /// validation (often a cache hit from a prior operation).
+    pub fn read_ndef_fast(&mut self, variant: Variant) -> Result<DataVec, ReaderError<T::Error>> {
+        let cc = self.read_cc()?;
+        if !cc.is_valid() {
+            return Err(Type2Error::InvalidMagic(0).into());
+        }
+
+        // READ block 4 (pages 4–7, 16 bytes) to scan for the NDEF TLV
+        // header. This covers Lock/Memory Control TLVs and the start of
+        // the NDEF data on most tags. The read cache makes this free if
+        // read_cc already fetched overlapping blocks.
+        let first_data = self.read(4)?;
+
+        // Scan TLVs in these 16 bytes to find the NDEF Message TLV.
+        let mut offset = 0usize;
+        loop {
+            if offset >= first_data.len() {
+                return Ok(DataVec::new());
+            }
+            let tag = first_data[offset];
+            offset += 1;
+            match tag {
+                0x00 => continue,                  // NULL TLV
+                0xFE => return Ok(DataVec::new()), // Terminator
+                0x03 => break,                     // NDEF Message TLV
+                _ => {
+                    // Skip unknown/control TLV: read L, advance past V.
+                    if offset >= first_data.len() {
+                        return Err(Type2Error::InvalidTlv.into());
+                    }
+                    if first_data[offset] == 0xFF {
+                        if offset + 3 > first_data.len() {
+                            return Err(Type2Error::InvalidTlv.into());
+                        }
+                        let len =
+                            u16::from_be_bytes([first_data[offset + 1], first_data[offset + 2]]);
+                        offset += 3 + len as usize;
+                    } else {
+                        offset += 1 + first_data[offset] as usize;
+                    }
+                }
+            }
+        }
+
+        // Parse the L field of the NDEF Message TLV.
+        if offset >= first_data.len() {
+            return Err(Type2Error::InvalidTlv.into());
+        }
+        let (ndef_len, l_size) = if first_data[offset] == 0xFF {
+            if offset + 3 > first_data.len() {
+                return Err(Type2Error::InvalidTlv.into());
+            }
+            let len = u16::from_be_bytes([first_data[offset + 1], first_data[offset + 2]]);
+            (len, 3usize)
+        } else {
+            (first_data[offset] as u16, 1usize)
+        };
+
+        if ndef_len == 0 {
+            return Ok(DataVec::new()); // INITIALIZED state
+        }
+
+        // Compute the absolute byte range of the NDEF V field.
+        let v_start_byte = 4 * 4 + offset + l_size; // page 4 base + TLV offset + L size
+        let v_end_byte = v_start_byte + ndef_len as usize - 1;
+        let start_page = (v_start_byte / 4) as u8;
+        let end_page = (v_end_byte / 4) as u8;
+
+        let last_user = variant.first_user_page() + variant.user_pages() - 1;
+        if end_page > last_user {
+            return Err(Type2Error::OutOfRange.into());
+        }
+
+        // FAST_READ only the pages containing the NDEF data.
+        let raw = self.fast_read(start_page, end_page)?;
+
+        // Extract just the NDEF bytes (skip page-alignment padding).
+        let skip = v_start_byte - start_page as usize * 4;
+        let mut result = DataVec::new();
+        nfc_forum_tags::vec::VecExt::try_extend(&mut result, &raw[skip..skip + ndef_len as usize])
+            .map_err(|_| Type2Error::BufferFull)?;
+        Ok(result)
+    }
+
     // ── NTAG-specific commands ─────────────────────────────────────
 
     /// GET_VERSION: retrieve chip identification (8 bytes).
@@ -281,10 +376,13 @@ mod tests {
         }
     }
 
-    impl T2TTransceiver for MockNtagTransceiver {
+    /// Frame buffer size for tests: large enough for NTAG216 FAST_READ.
+    const TEST_FRAME_SIZE: usize = 924;
+
+    impl T2TTransceiver<TEST_FRAME_SIZE> for MockNtagTransceiver {
         type Error = ();
 
-        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec, ()> {
+        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec<TEST_FRAME_SIZE>, ()> {
             if cmd.is_empty() {
                 return Err(());
             }
@@ -429,5 +527,28 @@ mod tests {
         let mut reader = NtagReader::new(&mut mock);
         let ndef = reader.read_ndef().unwrap();
         assert!(ndef.is_empty()); // INITIALIZED state
+    }
+
+    #[test]
+    fn read_ndef_fast_empty() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        let mut reader = NtagReader::new(&mut mock);
+        let ndef = reader.read_ndef_fast(Variant::Ntag216).unwrap();
+        assert!(ndef.is_empty()); // INITIALIZED state
+    }
+
+    #[test]
+    fn read_ndef_fast_with_data() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        // Write NDEF TLV with empty NDEF message D00000h.
+        mock.memory[16] = 0x03; // T
+        mock.memory[17] = 0x03; // L = 3
+        mock.memory[18] = 0xD0; // V[0]
+        mock.memory[19] = 0x00; // V[1]
+        mock.memory[20] = 0x00; // V[2]
+        mock.memory[21] = 0xFE; // Terminator
+        let mut reader = NtagReader::new(&mut mock);
+        let ndef = reader.read_ndef_fast(Variant::Ntag216).unwrap();
+        assert_eq!(&*ndef, &[0xD0, 0x00, 0x00]);
     }
 }

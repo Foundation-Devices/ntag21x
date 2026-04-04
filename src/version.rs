@@ -17,6 +17,11 @@ pub enum Variant {
 }
 
 impl Variant {
+    /// First user memory page (always page 4 for NTAG21x).
+    pub fn first_user_page(self) -> u8 {
+        4
+    }
+
     /// Number of user memory pages.
     pub fn user_pages(self) -> u8 {
         match self {
