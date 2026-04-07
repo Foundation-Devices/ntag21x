@@ -346,6 +346,114 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
         let data = self.read(cfg0_page)?;
         Ok(data[3]) // AUTH0 is byte 3 of CFG0
     }
+
+    /// Check if password protection is active.
+    ///
+    /// Returns `None` if protection is disabled (AUTH0 beyond last user
+    /// page). Returns `Some(prot)` if enabled, where `prot` is `false`
+    /// for write-only protection and `true` for read+write protection.
+    pub fn is_protected(
+        &mut self,
+        variant: Variant,
+    ) -> Result<Option<bool>, ReaderError<T::Error>> {
+        let (mirror, access) = self.read_config(variant)?;
+        let last_user = variant.first_user_page() + variant.user_pages() - 1;
+        if mirror.auth0 <= last_user {
+            Ok(Some(access.prot))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // ── Configuration write helpers ────────────────────────────────
+
+    /// Write the mirror configuration (CFG0 page).
+    ///
+    /// This sets mirror mode, mirror page/byte, strong modulation, and
+    /// AUTH0 in a single page write.
+    pub fn write_mirror_config(
+        &mut self,
+        variant: Variant,
+        config: &MirrorConfig,
+    ) -> Result<(), ReaderError<T::Error>> {
+        self.write(variant.cfg0_page(), config.to_cfg0())
+    }
+
+    /// Write the access configuration (CFG1 page).
+    ///
+    /// This sets PROT, CFGLCK, NFC_CNT_EN, NFC_CNT_PWD_PROT, and
+    /// AUTHLIM in a single page write.
+    pub fn write_access_config(
+        &mut self,
+        variant: Variant,
+        config: &AccessConfig,
+    ) -> Result<(), ReaderError<T::Error>> {
+        self.write(variant.cfg1_page(), config.to_cfg1())
+    }
+
+    /// Set the 4-byte password.
+    pub fn write_pwd(
+        &mut self,
+        variant: Variant,
+        pwd: [u8; 4],
+    ) -> Result<(), ReaderError<T::Error>> {
+        self.write(variant.pwd_page(), pwd)
+    }
+
+    /// Set the 2-byte PACK (Password ACKnowledge).
+    ///
+    /// Bytes 2–3 of the PACK page are RFU and written as 0x00.
+    pub fn write_pack(
+        &mut self,
+        variant: Variant,
+        pack: [u8; 2],
+    ) -> Result<(), ReaderError<T::Error>> {
+        self.write(variant.pack_page(), [pack[0], pack[1], 0x00, 0x00])
+    }
+
+    /// Enable password protection starting at page `auth0`.
+    ///
+    /// Writes in safe order: PWD, PACK, CFG1 (PROT/AUTHLIM), then
+    /// CFG0 (AUTH0 last — this activates protection).
+    ///
+    /// Set `read_write_protect` to `false` for write-only protection
+    /// or `true` for read+write protection.
+    pub fn enable_protection(
+        &mut self,
+        variant: Variant,
+        auth0: u8,
+        pwd: [u8; 4],
+        pack: [u8; 2],
+        read_write_protect: bool,
+    ) -> Result<(), ReaderError<T::Error>> {
+        // 1. Set password first (before protection is active).
+        self.write_pwd(variant, pwd)?;
+
+        // 2. Set PACK.
+        self.write_pack(variant, pack)?;
+
+        // 3. Set PROT bit in CFG1 (read current config to preserve other bits).
+        let (_, mut access) = self.read_config(variant)?;
+        access.prot = read_write_protect;
+        self.write_access_config(variant, &access)?;
+
+        // 4. Set AUTH0 in CFG0 last (activates protection).
+        let (mut mirror, _) = self.read_config(variant)?;
+        mirror.auth0 = auth0;
+        self.write_mirror_config(variant, &mirror)?;
+
+        Ok(())
+    }
+
+    /// Disable password protection.
+    ///
+    /// Sets AUTH0 to 0xFF, which places the protection boundary beyond
+    /// any addressable page.
+    pub fn disable_protection(&mut self, variant: Variant) -> Result<(), ReaderError<T::Error>> {
+        let (mut mirror, _) = self.read_config(variant)?;
+        mirror.auth0 = 0xFF;
+        self.write_mirror_config(variant, &mirror)
+    }
 }
 
 #[cfg(test)]
@@ -550,5 +658,102 @@ mod tests {
         let mut reader = NtagReader::new(&mut mock);
         let ndef = reader.read_ndef_fast(Variant::Ntag216).unwrap();
         assert_eq!(&*ndef, &[0xD0, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn is_protected_default_disabled() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        // Default CFG0: AUTH0 = 0xFF (disabled).
+        let cfg0_addr = Variant::Ntag216.cfg0_page() as usize * 4;
+        mock.memory[cfg0_addr] = 0x08; // STRG_MOD_EN
+        mock.memory[cfg0_addr + 3] = 0xFF; // AUTH0
+        let mut reader = NtagReader::new(&mut mock);
+        assert_eq!(reader.is_protected(Variant::Ntag216).unwrap(), None);
+    }
+
+    #[test]
+    fn is_protected_write_only() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        let cfg0_addr = Variant::Ntag216.cfg0_page() as usize * 4;
+        mock.memory[cfg0_addr + 3] = 0x04; // AUTH0 = page 4
+        let cfg1_addr = Variant::Ntag216.cfg1_page() as usize * 4;
+        mock.memory[cfg1_addr] = 0x00; // PROT = 0 (write-only)
+        let mut reader = NtagReader::new(&mut mock);
+        assert_eq!(reader.is_protected(Variant::Ntag216).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn is_protected_read_write() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        let cfg0_addr = Variant::Ntag216.cfg0_page() as usize * 4;
+        mock.memory[cfg0_addr + 3] = 0x04; // AUTH0 = page 4
+        let cfg1_addr = Variant::Ntag216.cfg1_page() as usize * 4;
+        mock.memory[cfg1_addr] = 0x80; // PROT = 1 (read+write)
+        let mut reader = NtagReader::new(&mut mock);
+        assert_eq!(reader.is_protected(Variant::Ntag216).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn enable_then_check_protection() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        // Set default config pages.
+        let cfg0_addr = Variant::Ntag216.cfg0_page() as usize * 4;
+        mock.memory[cfg0_addr] = 0x08; // STRG_MOD_EN
+        mock.memory[cfg0_addr + 3] = 0xFF; // AUTH0 disabled
+        let mut reader = NtagReader::new(&mut mock);
+
+        // Enable write-only protection from page 0x10.
+        reader
+            .enable_protection(
+                Variant::Ntag216,
+                0x10,
+                [0x11, 0x22, 0x33, 0x44],
+                [0xAB, 0xCD],
+                false,
+            )
+            .unwrap();
+
+        // Verify protection is active.
+        assert_eq!(reader.is_protected(Variant::Ntag216).unwrap(), Some(false));
+
+        // Verify AUTH0 was written.
+        assert_eq!(reader.read_auth0(Variant::Ntag216).unwrap(), 0x10);
+    }
+
+    #[test]
+    fn disable_protection() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        let cfg0_addr = Variant::Ntag216.cfg0_page() as usize * 4;
+        mock.memory[cfg0_addr] = 0x08;
+        mock.memory[cfg0_addr + 3] = 0x10; // AUTH0 = 0x10 (enabled)
+        let mut reader = NtagReader::new(&mut mock);
+
+        reader.disable_protection(Variant::Ntag216).unwrap();
+
+        assert_eq!(reader.is_protected(Variant::Ntag216).unwrap(), None);
+        assert_eq!(reader.read_auth0(Variant::Ntag216).unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn write_pwd_and_pack() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        let mut reader = NtagReader::new(&mut mock);
+
+        reader
+            .write_pwd(Variant::Ntag216, [0xDE, 0xAD, 0xBE, 0xEF])
+            .unwrap();
+        reader.write_pack(Variant::Ntag216, [0x12, 0x34]).unwrap();
+
+        // Verify in mock memory.
+        let pwd_addr = Variant::Ntag216.pwd_page() as usize * 4;
+        assert_eq!(
+            &mock.memory[pwd_addr..pwd_addr + 4],
+            &[0xDE, 0xAD, 0xBE, 0xEF]
+        );
+        let pack_addr = Variant::Ntag216.pack_page() as usize * 4;
+        assert_eq!(
+            &mock.memory[pack_addr..pack_addr + 4],
+            &[0x12, 0x34, 0x00, 0x00]
+        );
     }
 }
