@@ -29,9 +29,9 @@ dependencies = [
 
 [[package]]
 name = "nfc-forum-tags"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa2b7dcf8c647f2ab69218fd6871165c1f2b92d628c46ac5eeff8500ab32bd5"
+checksum = "03aecb4fa2c55b1d23c26cee4a502cb2b58a09ed5a4531e300c714c22cc8dbeb"
 dependencies = [
  "heapless",
  "num_enum",

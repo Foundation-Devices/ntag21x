@@ -15,4 +15,4 @@ std = ["alloc", "nfc-forum-tags/std"]
 
 [dependencies]
 heapless = "0.9"
-nfc-forum-tags = "0.2"
+nfc-forum-tags = "0.3"
