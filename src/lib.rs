@@ -1075,6 +1075,75 @@ mod tests {
         }
     }
 
+    // ── Malformed control TLVs via delegated reads (SFT-7603) ──────
+
+    /// A malicious tag presenting the audit's Lock Control TLV
+    /// `[01, 03, F0, 08, 1F]` (byte address 491,520 — past the last sector)
+    /// must produce a typed `InvalidTlv` through the delegated `read_ndef`,
+    /// not a panic in overflow-checked builds nor a wrapped, bogus layout.
+    #[test]
+    fn read_ndef_rejects_out_of_range_lock_control_tlv() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        // Dynamic CC so the layout path builds lock areas.
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x6D, 0x00]);
+        // Lock Control TLV with the demonstrated out-of-range descriptor.
+        mock.memory[16] = 0x01;
+        mock.memory[17] = 0x03;
+        mock.memory[18] = 0xF0;
+        mock.memory[19] = 0x08;
+        mock.memory[20] = 0x1F;
+        mock.memory[21] = 0xFE; // Terminator
+
+        let mut reader = NtagReader::new(&mut mock);
+        let res = reader.read_ndef();
+        assert!(
+            matches!(res, Err(ReaderError::Protocol(Type2Error::InvalidTlv))),
+            "expected InvalidTlv, got {res:?}"
+        );
+    }
+
+    /// The same shape with a Memory Control TLV is rejected identically.
+    #[test]
+    fn read_ndef_rejects_out_of_range_memory_control_tlv() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x6D, 0x00]);
+        mock.memory[16] = 0x02; // Memory Control
+        mock.memory[17] = 0x03;
+        mock.memory[18] = 0xF0; // page 15
+        mock.memory[19] = 0x08; // size 8
+        mock.memory[20] = 0x0F; // bytes_per_page = 15 → 491,520
+        mock.memory[21] = 0xFE;
+
+        let mut reader = NtagReader::new(&mut mock);
+        assert!(matches!(
+            reader.read_ndef(),
+            Err(ReaderError::Protocol(Type2Error::InvalidTlv))
+        ));
+    }
+
+    /// A tag with a legitimate in-range control TLV still reads normally, so
+    /// the validation does not break valid dynamic tags.
+    #[test]
+    fn read_ndef_accepts_in_range_control_tlv() {
+        let mut mock = MockNtagTransceiver::new_ntag216();
+        mock.memory[12..16].copy_from_slice(&[0xE1, 0x10, 0x6D, 0x00]);
+        mock.memory[16] = 0x01; // Lock Control
+        mock.memory[17] = 0x03;
+        mock.memory[18] = 0xE0; // page 14, offset 0
+        mock.memory[19] = 0x06; // 6 lock bits
+        mock.memory[20] = 0x33; // locked_per_bit=3, bytes_per_page=3 → addr 112
+        mock.memory[21] = 0x03; // NDEF Message TLV
+        mock.memory[22] = 0x03; // L = 3
+        mock.memory[23] = 0xD0;
+        mock.memory[24] = 0x00;
+        mock.memory[25] = 0x00;
+        mock.memory[26] = 0xFE;
+
+        let mut reader = NtagReader::new(&mut mock);
+        let ndef = reader.read_ndef().unwrap();
+        assert_eq!(&*ndef, &[0xD0, 0x00, 0x00]);
+    }
+
     // ── COMPATIBILITY_WRITE replay safety (SFT-7600) ───────────────
 
     /// Models the dangerous boundary: the tag commits phase 2, then the
