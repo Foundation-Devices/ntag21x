@@ -336,12 +336,27 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
     ///
     /// Phase 1 sends the command + address, phase 2 sends 16 bytes
     /// (only the first 4 are written, rest must be 0x00).
+    ///
+    /// # Ambiguous outcomes
+    ///
+    /// Phase 2 is sent **exactly once** and is never retried. Its 16 bytes are
+    /// data only while the tag is in data state; once the tag has returned to
+    /// command state the same bytes parse as a fresh command, so replaying a
+    /// payload that begins with, say, `0xA2` would execute an unintended WRITE
+    /// to an attacker-chosen page.
+    ///
+    /// If phase 2 fails in transport, the tag may or may not have committed the
+    /// write. This returns [`Type2Error::AmbiguousOutcome`] and marks the tag
+    /// state unknown. Recover by reactivating the tag and reading back `addr`
+    /// to determine what actually happened, before issuing any other
+    /// state-changing command.
     pub fn compatibility_write(
         &mut self,
         addr: u8,
         data: [u8; 4],
     ) -> Result<(), ReaderError<T::Error>> {
-        // Phase 1: [0xA0, addr] → ACK.
+        // Phase 1: [0xA0, addr] → ACK. This frame is sent in command state and
+        // changes no memory, so the generic retry is safe here.
         let raw = self
             .inner
             .transceive_with_retry(&[command::CMD_COMPATIBILITY_WRITE, addr])?;
@@ -350,10 +365,19 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
             return Err(Type2Error::Nack(val).into());
         }
 
-        // Phase 2: [data(4) + padding(12)] → ACK.
+        // Phase 2: [data(4) + padding(12)] → ACK. Sent once, bypassing the
+        // retry helper (see the note above).
         let mut payload = [0u8; 16];
         payload[..4].copy_from_slice(&data);
-        let raw = self.inner.transceive_with_retry(&payload)?;
+        self.inner.invalidate_cache();
+        let raw = match self.inner.transceiver().transceive(&payload) {
+            Ok(raw) => raw,
+            Err(_) => {
+                // The tag may already have committed the write. Do not replay.
+                self.inner.mark_tag_state_unknown();
+                return Err(Type2Error::AmbiguousOutcome.into());
+            }
+        };
         let val = raw.first().copied().unwrap_or(0) & 0x0F;
         if val != nfc_forum_tags::type2::ACK {
             return Err(Type2Error::Nack(val).into());
@@ -1049,5 +1073,169 @@ mod tests {
                 "{variant:?} value bytes mismatch"
             );
         }
+    }
+
+    // ── COMPATIBILITY_WRITE replay safety (SFT-7600) ───────────────
+
+    /// Models the dangerous boundary: the tag commits phase 2, then the
+    /// acknowledgement is lost so the transceiver reports an error. Any
+    /// retransmission arrives in *command* state, where the payload's first
+    /// bytes would be parsed as a new command. Records every frame so the test
+    /// can prove the payload was sent only once and no second command ran.
+    struct LostAckTransceiver {
+        memory: [u8; 924],
+        /// Every frame the reader transmitted, in order.
+        frames: heapless::Vec<heapless::Vec<u8, 16>, 8>,
+        /// True once phase 1 has been acknowledged (tag is in data state).
+        in_data_state: bool,
+        /// Pages written as a result of a frame parsed in command state.
+        command_state_writes: heapless::Vec<u8, 8>,
+        /// When true, phase 2 commits but its acknowledgement is lost.
+        lose_ack: bool,
+        /// Address captured from phase 1.
+        pending_addr: u8,
+    }
+
+    impl LostAckTransceiver {
+        fn new() -> Self {
+            LostAckTransceiver {
+                memory: [0u8; 924],
+                frames: heapless::Vec::new(),
+                in_data_state: false,
+                command_state_writes: heapless::Vec::new(),
+                lose_ack: true,
+                pending_addr: 0,
+            }
+        }
+    }
+
+    impl T2TTransceiver<TEST_FRAME_SIZE> for LostAckTransceiver {
+        type Error = ();
+
+        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec<TEST_FRAME_SIZE>, ()> {
+            let mut rec = heapless::Vec::<u8, 16>::new();
+            let _ = rec.extend_from_slice(&cmd[..cmd.len().min(16)]);
+            let _ = self.frames.push(rec);
+
+            if self.in_data_state {
+                // Phase 2 payload: commit the intended write to the address
+                // captured in phase 1, then either lose the ACK or return it.
+                self.in_data_state = false;
+                let start = self.pending_addr as usize * 4;
+                if start + 4 <= self.memory.len() && cmd.len() >= 4 {
+                    self.memory[start..start + 4].copy_from_slice(&cmd[..4]);
+                }
+                if self.lose_ack {
+                    return Err(());
+                }
+                let mut response = FrameVec::new();
+                let _ = response.try_push(ACK);
+                return Ok(response);
+            }
+
+            match cmd.first().copied() {
+                // Phase 1 of COMPATIBILITY_WRITE: enter data state.
+                Some(0xA0) => {
+                    self.in_data_state = true;
+                    self.pending_addr = cmd[1];
+                    let mut response = FrameVec::new();
+                    let _ = response.try_push(ACK);
+                    Ok(response)
+                }
+                // A WRITE parsed in command state — exactly what a replayed
+                // payload beginning 0xA2 would become.
+                Some(0xA2) => {
+                    let _ = self.command_state_writes.push(cmd[1]);
+                    let start = cmd[1] as usize * 4;
+                    if start + 4 <= self.memory.len() && cmd.len() >= 6 {
+                        self.memory[start..start + 4].copy_from_slice(&cmd[2..6]);
+                    }
+                    let mut response = FrameVec::new();
+                    let _ = response.try_push(ACK);
+                    Ok(response)
+                }
+                Some(0x30) => {
+                    let mut response = FrameVec::new();
+                    let _ = response.try_extend(&[0u8; 16]);
+                    Ok(response)
+                }
+                _ => Err(()),
+            }
+        }
+
+        fn transceive_no_response(&mut self, _cmd: &[u8]) -> Result<Option<u8>, ()> {
+            Ok(None)
+        }
+    }
+
+    /// A lost acknowledgement after commit must produce exactly one 16-byte
+    /// transmission, an ambiguous-outcome error, and no second command — even
+    /// when the payload's leading bytes form a valid WRITE to a security page.
+    #[test]
+    fn compatibility_write_never_replays_phase_two() {
+        // 0xA2 = WRITE, 0x2A = NTAG213 CFG1 page: a replay would reconfigure
+        // access protection.
+        for payload in [
+            [0xA2, 0x2A, 0xC0, 0x00],
+            [0xA0, 0x2B, 0x11, 0x22],
+            [0x30, 0x04, 0x00, 0x00],
+        ] {
+            let mut mock = LostAckTransceiver::new();
+            {
+                let mut reader = NtagReader::new(&mut mock);
+                reader.set_max_retries(3); // retries must not apply to phase 2
+                let res = reader.compatibility_write(0x04, payload);
+                assert!(
+                    matches!(
+                        res,
+                        Err(ReaderError::Protocol(Type2Error::AmbiguousOutcome))
+                    ),
+                    "payload {payload:02X?} should report an ambiguous outcome, got {res:?}"
+                );
+            }
+            // Frame 1 is phase 1 (2 bytes); frame 2 is the single phase-2
+            // payload. Nothing after it.
+            assert_eq!(
+                mock.frames.len(),
+                2,
+                "payload {payload:02X?}: expected exactly one phase-2 transmission"
+            );
+            assert_eq!(mock.frames[1].len(), 16);
+            assert!(
+                mock.command_state_writes.is_empty(),
+                "payload {payload:02X?}: no command may execute from a replay"
+            );
+        }
+    }
+
+    /// After an ambiguous phase 2, the reader's sector state is unknown so the
+    /// caller cannot proceed on stale assumptions.
+    #[test]
+    fn compatibility_write_ambiguity_marks_state_unknown() {
+        let mut mock = LostAckTransceiver::new();
+        let mut reader = NtagReader::new(&mut mock);
+        assert!(
+            reader
+                .compatibility_write(0x04, [0xA2, 0x2A, 0xC0, 0x00])
+                .is_err()
+        );
+        assert_eq!(reader.inner().current_sector(), None);
+    }
+
+    /// The success path still works: phase 2 acknowledged normally, the write
+    /// lands on the requested page, and exactly two frames are sent.
+    #[test]
+    fn compatibility_write_success_path() {
+        let mut mock = LostAckTransceiver::new();
+        mock.lose_ack = false;
+        {
+            let mut reader = NtagReader::new(&mut mock);
+            reader
+                .compatibility_write(0x04, [0xDE, 0xAD, 0xBE, 0xEF])
+                .unwrap();
+        }
+        assert_eq!(&mock.memory[16..20], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(mock.frames.len(), 2);
+        assert!(mock.command_state_writes.is_empty());
     }
 }
