@@ -191,24 +191,45 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
             return Ok(DataVec::new()); // INITIALIZED state
         }
 
-        // Compute the absolute byte range of the NDEF V field.
+        // Compute the absolute byte range of the NDEF V field. All page and
+        // byte math stays in usize so an attacker-chosen extended length
+        // cannot wrap a `u8` page number into a small in-range value and
+        // slip a short FAST_READ past the bounds check below.
+        let ndef_len = ndef_len as usize;
         let v_start_byte = 4 * 4 + offset + l_size; // page 4 base + TLV offset + L size
-        let v_end_byte = v_start_byte + ndef_len as usize - 1;
-        let start_page = (v_start_byte / 4) as u8;
-        let end_page = (v_end_byte / 4) as u8;
+        let v_end_byte = v_start_byte + ndef_len - 1;
+        let start_page_wide = v_start_byte / 4;
+        let end_page_wide = v_end_byte / 4;
 
-        let last_user = variant.first_user_page() + variant.user_pages() - 1;
-        if end_page > last_user {
+        // Prove the whole value range fits both boundaries before narrowing
+        // any page number to u8:
+        //   1. the selected variant's user-memory pages, and
+        //   2. the Capability Container data area (which can be smaller than
+        //      physical user memory), whose bytes begin at page 4.
+        let last_user_page = variant.first_user_page() as usize + variant.user_pages() as usize - 1;
+        let data_area_end_byte = 4 * 4 + cc.data_area_size() as usize;
+        if end_page_wide > last_user_page || v_end_byte >= data_area_end_byte {
             return Err(Type2Error::OutOfRange.into());
         }
+
+        // Narrow to u8 only after the range is proven in bounds. Fallible
+        // conversion keeps this safe even if the boundaries above ever change.
+        let start_page = u8::try_from(start_page_wide).map_err(|_| Type2Error::OutOfRange)?;
+        let end_page = u8::try_from(end_page_wide).map_err(|_| Type2Error::OutOfRange)?;
 
         // FAST_READ only the pages containing the NDEF data.
         let raw = self.fast_read(start_page, end_page)?;
 
-        // Extract just the NDEF bytes (skip page-alignment padding).
+        // Extract just the NDEF bytes (skip page-alignment padding). Prove the
+        // response actually contains the full slice before indexing, so a
+        // short frame yields a typed error instead of a panic.
         let skip = v_start_byte - start_page as usize * 4;
+        let slice_end = skip + ndef_len;
+        if raw.len() < slice_end {
+            return Err(Type2Error::InvalidLength.into());
+        }
         let mut result = DataVec::new();
-        nfc_forum_tags::vec::VecExt::try_extend(&mut result, &raw[skip..skip + ndef_len as usize])
+        nfc_forum_tags::vec::VecExt::try_extend(&mut result, &raw[skip..slice_end])
             .map_err(|_| Type2Error::BufferFull)?;
         Ok(result)
     }
@@ -920,6 +941,113 @@ mod tests {
             );
             // Sanity: the NDEF TLV header was actually written.
             assert_eq!(mock.memory[16], 0x03, "{variant:?} NDEF T written");
+        }
+    }
+
+    // ── read_ndef_fast malicious-length panic hardening (SFT-7599) ──
+
+    const ALL_VARIANTS: [(Variant, u8); 3] = [
+        (Variant::Ntag213, 0x12), // CC data area 144
+        (Variant::Ntag215, 0x3E), // CC data area 496
+        (Variant::Ntag216, 0x6D), // CC data area 872
+    ];
+
+    /// Build an NTAG216-sized mock with a valid CC for `size_field`, an
+    /// optional run of NULL TLVs as an offset, and an extended-length NDEF
+    /// Message TLV header (`03 FF hi lo`) declaring `ndef_len`. When `fill_v`,
+    /// the value bytes are written as `i % 256` so the decoded slice can be
+    /// checked byte for byte.
+    fn setup_fast_tag(
+        size_field: u8,
+        null_prefix: usize,
+        ndef_len: u16,
+        fill_v: bool,
+    ) -> MockNtagTransceiver {
+        let mut t = MockNtagTransceiver { memory: [0u8; 924] };
+        t.memory[12] = 0xE1; // magic
+        t.memory[13] = 0x10; // version 1.0
+        t.memory[14] = size_field; // CC data area = size_field * 8
+        t.memory[15] = 0x00; // r/w access
+        let hdr = 16 + null_prefix; // NULL TLVs (0x00) occupy the offset
+        t.memory[hdr] = 0x03; // NDEF Message TLV
+        t.memory[hdr + 1] = 0xFF; // 3-byte length marker
+        t.memory[hdr + 2] = (ndef_len >> 8) as u8;
+        t.memory[hdr + 3] = ndef_len as u8;
+        if fill_v {
+            let v = hdr + 4;
+            for i in 0..ndef_len as usize {
+                if v + i < t.memory.len() {
+                    t.memory[v + i] = (i % 256) as u8;
+                }
+            }
+        }
+        t
+    }
+
+    /// The 1,028-byte proof header whose end page wraps a `u8` to a small
+    /// in-range value must return a typed error, not panic, on every variant.
+    #[test]
+    fn read_ndef_fast_rejects_wrapping_length() {
+        for (variant, size_field) in ALL_VARIANTS {
+            let mut mock = setup_fast_tag(size_field, 0, 0x0404, false); // 1028
+            let mut reader = NtagReader::new(&mut mock);
+            let res = reader.read_ndef_fast(variant);
+            assert!(
+                matches!(res, Err(ReaderError::Protocol(Type2Error::OutOfRange))),
+                "{variant:?}: expected OutOfRange, got {res:?}"
+            );
+        }
+    }
+
+    /// The same wrapping length behind a range of NULL-TLV offsets is still
+    /// rejected without panic, covering non-zero NDEF TLV offsets.
+    #[test]
+    fn read_ndef_fast_rejects_wrapping_length_at_offsets() {
+        for (variant, size_field) in ALL_VARIANTS {
+            for null_prefix in 0usize..=8 {
+                let mut mock = setup_fast_tag(size_field, null_prefix, 0x0404, false);
+                let mut reader = NtagReader::new(&mut mock);
+                let res = reader.read_ndef_fast(variant);
+                assert!(
+                    matches!(res, Err(ReaderError::Protocol(Type2Error::OutOfRange))),
+                    "{variant:?} offset {null_prefix}: expected OutOfRange, got {res:?}"
+                );
+            }
+        }
+    }
+
+    /// Exhaustively sweep every 16-bit extended length across all three
+    /// variants: each call must return `Ok` or a typed error, never panic.
+    #[test]
+    fn read_ndef_fast_all_lengths_no_panic() {
+        for (variant, size_field) in ALL_VARIANTS {
+            let mut mock = setup_fast_tag(size_field, 0, 0, false);
+            for len in 0u16..=u16::MAX {
+                mock.memory[18] = (len >> 8) as u8;
+                mock.memory[19] = len as u8;
+                let mut reader = NtagReader::new(&mut mock);
+                // The result is intentionally ignored; a panic fails the test.
+                let _ = reader.read_ndef_fast(variant);
+            }
+        }
+    }
+
+    /// A valid maximum-sized NDEF for each variant reads back correctly.
+    #[test]
+    fn read_ndef_fast_max_valid_ndef_succeeds() {
+        for (variant, size_field) in ALL_VARIANTS {
+            let data_area = size_field as usize * 8;
+            // Extended TLV header (4 bytes) starts the data area, so the
+            // largest value ends exactly at the data-area boundary.
+            let max_v = data_area - 4;
+            let mut mock = setup_fast_tag(size_field, 0, max_v as u16, true);
+            let mut reader = NtagReader::new(&mut mock);
+            let ndef = reader.read_ndef_fast(variant).unwrap();
+            assert_eq!(ndef.len(), max_v, "{variant:?} length");
+            assert!(
+                ndef.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8),
+                "{variant:?} value bytes mismatch"
+            );
         }
     }
 }
