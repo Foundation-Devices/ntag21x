@@ -92,7 +92,24 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
     }
 
     /// Write NDEF message bytes to the tag.
+    ///
+    /// Rejects payloads that cannot fit the tag's data area before
+    /// delegating, so an oversized attacker-influenced buffer can never
+    /// reach a page-write path — a defense-in-depth guard against
+    /// overwriting the dynamic-lock, configuration, PWD, and PACK pages
+    /// (SFT-7601) that holds even if linked against an unfixed
+    /// `nfc-forum-tags`. The CC read here is served from the reader cache
+    /// by the delegated call, so it costs no extra RF traffic.
     pub fn write_ndef(&mut self, ndef_data: &[u8]) -> Result<(), ReaderError<T::Error>> {
+        let cc = self.inner.read_cc()?;
+        // Largest possible payload is the data area minus the minimal TLV
+        // framing (T + 1-byte L + Terminator = 3 bytes). This is a loose
+        // upper bound; the underlying writer performs the exact,
+        // offset-aware capacity check.
+        let max_payload = cc.data_area_size().saturating_sub(3) as usize;
+        if ndef_data.len() > max_payload {
+            return Err(Type2Error::OutOfRange.into());
+        }
         self.inner.write_ndef(ndef_data)
     }
 
@@ -755,5 +772,154 @@ mod tests {
             &mock.memory[pack_addr..pack_addr + 4],
             &[0x12, 0x34, 0x00, 0x00]
         );
+    }
+
+    // ── write_ndef bounds enforcement (SFT-7601) ───────────────────
+
+    /// NTAG mock that applies writes to flat memory and counts every WRITE,
+    /// with the security pages (dynamic lock, CFG0, CFG1, PWD, PACK) stamped
+    /// with a sentinel so tests can prove they were never overwritten.
+    struct RecordingNtag {
+        memory: [u8; 924],
+        writes: usize,
+    }
+
+    const SENTINEL: [u8; 4] = [0x99, 0x99, 0x99, 0x99];
+
+    impl RecordingNtag {
+        fn new(variant: Variant, size_field: u8) -> Self {
+            let mut t = RecordingNtag {
+                memory: [0u8; 924],
+                writes: 0,
+            };
+            // CC (page 3).
+            t.memory[12] = 0xE1; // magic
+            t.memory[13] = 0x10; // version 1.0
+            t.memory[14] = size_field; // data area = size_field * 8
+            t.memory[15] = 0x00; // r/w access
+            // Empty NDEF Message TLV + Terminator (page 4).
+            t.memory[16] = 0x03;
+            t.memory[17] = 0x00;
+            t.memory[18] = 0xFE;
+            // Stamp the security pages so any stray write is detectable.
+            for page in t.security_pages(variant) {
+                let a = page as usize * 4;
+                t.memory[a..a + 4].copy_from_slice(&SENTINEL);
+            }
+            t
+        }
+
+        fn security_pages(&self, v: Variant) -> [u8; 5] {
+            [
+                v.dynamic_lock_page(),
+                v.cfg0_page(),
+                v.cfg1_page(),
+                v.pwd_page(),
+                v.pack_page(),
+            ]
+        }
+
+        fn security_untouched(&self, v: Variant) -> bool {
+            self.security_pages(v).iter().all(|&page| {
+                let a = page as usize * 4;
+                self.memory[a..a + 4] == SENTINEL
+            })
+        }
+    }
+
+    impl T2TTransceiver<TEST_FRAME_SIZE> for RecordingNtag {
+        type Error = ();
+
+        fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec<TEST_FRAME_SIZE>, ()> {
+            match cmd.first().copied() {
+                Some(0x30) => {
+                    // READ
+                    let start = cmd[1] as usize * 4;
+                    let mut response = FrameVec::new();
+                    let end = (start + 16).min(self.memory.len());
+                    let _ = response.try_extend(&self.memory[start..end]);
+                    while response.len() < 16 {
+                        let _ = response.try_push(0);
+                    }
+                    Ok(response)
+                }
+                Some(0xA2) => {
+                    // WRITE
+                    self.writes += 1;
+                    let start = cmd[1] as usize * 4;
+                    if start + 4 <= self.memory.len() && cmd.len() >= 6 {
+                        self.memory[start..start + 4].copy_from_slice(&cmd[2..6]);
+                    }
+                    let mut response = FrameVec::new();
+                    let _ = response.try_push(ACK);
+                    Ok(response)
+                }
+                _ => Err(()),
+            }
+        }
+
+        fn transceive_no_response(&mut self, _cmd: &[u8]) -> Result<Option<u8>, ()> {
+            Ok(None)
+        }
+    }
+
+    /// (variant, CC size field) for each supported NTAG.
+    const VARIANTS: [(Variant, u8); 3] = [
+        (Variant::Ntag213, 0x12), // 144-byte data area
+        (Variant::Ntag215, 0x3E), // 496-byte data area
+        (Variant::Ntag216, 0x6D), // 872-byte data area
+    ];
+
+    /// An oversized NDEF write (65,536 bytes) is rejected with a range error
+    /// and issues zero writes, leaving the security pages intact.
+    #[test]
+    fn write_ndef_oversized_rejected_no_writes() {
+        for (variant, size_field) in VARIANTS {
+            let mut mock = RecordingNtag::new(variant, size_field);
+            {
+                let mut reader = NtagReader::new(&mut mock);
+                let oversized = [0xAAu8; 65_536];
+                let res = reader.write_ndef(&oversized);
+                assert!(
+                    matches!(res, Err(ReaderError::Protocol(Type2Error::OutOfRange))),
+                    "{variant:?} should reject oversized input"
+                );
+            }
+            assert_eq!(mock.writes, 0, "{variant:?} must not write any page");
+            assert!(
+                mock.security_untouched(variant),
+                "{variant:?} security pages must be untouched"
+            );
+        }
+    }
+
+    /// The maximum valid payload for each variant is written successfully
+    /// and never touches the dynamic-lock or configuration pages.
+    #[test]
+    fn write_ndef_max_payload_spares_security_pages() {
+        // Big enough source buffer for the largest variant (872 - 3).
+        let src = [0x5Au8; 869];
+        for (variant, size_field) in VARIANTS {
+            let mut mock = RecordingNtag::new(variant, size_field);
+            let data_area = size_field as usize * 8;
+            // Framing is T + L + Terminator: L is 1 byte for payloads up to
+            // 0xFE, otherwise a 3-byte field. The largest payload that still
+            // fits the data area therefore reserves 3 or 5 bytes of framing.
+            let max_payload = if data_area - 3 <= 0xFE {
+                data_area - 3
+            } else {
+                data_area - 5
+            };
+            {
+                let mut reader = NtagReader::new(&mut mock);
+                reader.write_ndef(&src[..max_payload]).unwrap();
+            }
+            assert!(
+                mock.security_untouched(variant),
+                "{variant:?} max payload must not reach security pages"
+            );
+            // Sanity: the NDEF TLV header was actually written.
+            assert_eq!(mock.memory[16], 0x03, "{variant:?} NDEF T written");
+        }
     }
 }
