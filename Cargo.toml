@@ -1,12 +1,13 @@
 [package]
 name = "ntag21x"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87.0"
 categories = ["embedded", "no-std"]
 description = "NTAG213/215/216 NFC tag driver"
 keywords = ["nfc", "ntag", "no-std", "embedded"]
 license = "GPL-3.0-or-later"
+repository = "https://github.com/Foundation-Devices/ntag21x"
 
 [features]
 default = []
