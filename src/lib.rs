@@ -36,6 +36,29 @@ pub use version::{Variant, VersionInfo};
 use nfc_forum_tags::type2::{ReaderError, T2TReader, T2TTransceiver, Type2Error};
 use nfc_forum_tags::vec::DataVec;
 
+/// Password-protection status of a tag.
+///
+/// Distinguishes "protection is off" from "protection is on but its settings
+/// cannot be read without authenticating first" — a state the previous
+/// `Option<bool>` result could not express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionStatus {
+    /// AUTH0 lies beyond the last addressable page, which the chip defines as
+    /// protection disabled.
+    Disabled,
+    /// Protection is active from `first_protected_page` onwards.
+    Enabled {
+        /// First password-protected page (the AUTH0 value).
+        first_protected_page: u8,
+        /// `true` for read+write protection, `false` for write-only.
+        read_protected: bool,
+    },
+    /// The configuration pages are themselves within a read-protected range,
+    /// so their unauthenticated contents cannot be trusted. Authenticate with
+    /// [`NtagReader::pwd_auth`] and read again.
+    AuthenticationRequired,
+}
+
 /// NTAG213/215/216 reader/writer.
 ///
 /// Wraps a [`T2TReader`] and adds NTAG-specific commands. All standard
@@ -409,22 +432,55 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
         Ok(data[3]) // AUTH0 is byte 3 of CFG0
     }
 
+    /// Report the tag's password-protection status.
+    ///
+    /// The protection boundary is compared against the last *addressable*
+    /// page, not the last user-data page: NTAG21x allows protection to begin
+    /// in the configuration pages (dynamic lock, CFG0, CFG1, PWD, PACK), which
+    /// lie beyond user memory. Comparing against the last user page reported
+    /// valid configuration-only protection as disabled.
+    ///
+    /// Returns [`ProtectionStatus::AuthenticationRequired`] when the
+    /// configuration pages are themselves inside a read-protected range, since
+    /// an unauthenticated read of those pages cannot be trusted. Call
+    /// [`pwd_auth`](Self::pwd_auth) first and re-read in that case.
+    pub fn protection_status(
+        &mut self,
+        variant: Variant,
+    ) -> Result<ProtectionStatus, ReaderError<T::Error>> {
+        let (mirror, access) = self.read_config(variant)?;
+        if mirror.auth0 > variant.last_page() {
+            return Ok(ProtectionStatus::Disabled);
+        }
+        // The configuration pages fall inside a read-protected range, so the
+        // bytes just read may be rolled-over placeholders rather than the real
+        // configuration.
+        if access.prot && mirror.auth0 <= variant.cfg0_page() {
+            return Ok(ProtectionStatus::AuthenticationRequired);
+        }
+        Ok(ProtectionStatus::Enabled {
+            first_protected_page: mirror.auth0,
+            read_protected: access.prot,
+        })
+    }
+
     /// Check if password protection is active.
     ///
-    /// Returns `None` if protection is disabled (AUTH0 beyond last user
-    /// page). Returns `Some(prot)` if enabled, where `prot` is `false`
-    /// for write-only protection and `true` for read+write protection.
+    /// Returns `None` if protection is disabled, otherwise `Some(prot)` where
+    /// `prot` is `false` for write-only protection and `true` for read+write.
+    ///
+    /// Prefer [`protection_status`](Self::protection_status), which
+    /// distinguishes "disabled" from "cannot be determined without
+    /// authentication"; this helper reports the latter as `Some(true)`.
     pub fn is_protected(
         &mut self,
         variant: Variant,
     ) -> Result<Option<bool>, ReaderError<T::Error>> {
-        let (mirror, access) = self.read_config(variant)?;
-        let last_user = variant.first_user_page() + variant.user_pages() - 1;
-        if mirror.auth0 <= last_user {
-            Ok(Some(access.prot))
-        } else {
-            Ok(None)
-        }
+        Ok(match self.protection_status(variant)? {
+            ProtectionStatus::Disabled => None,
+            ProtectionStatus::Enabled { read_protected, .. } => Some(read_protected),
+            ProtectionStatus::AuthenticationRequired => Some(true),
+        })
     }
 
     // ── Configuration write helpers ────────────────────────────────
@@ -480,6 +536,24 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
     ///
     /// Set `read_write_protect` to `false` for write-only protection
     /// or `true` for read+write protection.
+    ///
+    /// # Supported boundaries
+    ///
+    /// `auth0` must be no greater than the variant's last addressable page
+    /// ([`Variant::last_page`], which is the PACK page). NTAG21x treats any
+    /// higher value — `0xFF` in particular — as *disabling* protection, so
+    /// accepting one here would install credentials and then report success for
+    /// an unprotected tag. Such a value is rejected with
+    /// [`Type2Error::InvalidConfiguration`] **before any write is issued**.
+    ///
+    /// Protecting only the configuration pages is legitimate: pass the dynamic
+    /// lock, CFG0, CFG1, PWD, or PACK page to leave user data accessible while
+    /// protecting the tag's own settings.
+    ///
+    /// Note that this does not make the configuration permanent — that
+    /// requires the CFGLCK bit (see [`AccessConfig`]), which is irreversible.
+    /// Reading back the state afterwards needs authentication whenever
+    /// `read_write_protect` is set and `auth0` covers the configuration pages.
     pub fn enable_protection(
         &mut self,
         variant: Variant,
@@ -488,6 +562,12 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
         pack: [u8; 2],
         read_write_protect: bool,
     ) -> Result<(), ReaderError<T::Error>> {
+        // Validate the boundary before any state-changing command, so an
+        // invalid request leaves the tag completely untouched.
+        if auth0 > variant.last_page() {
+            return Err(Type2Error::InvalidConfiguration.into());
+        }
+
         // 1. Set password first (before protection is active).
         self.write_pwd(variant, pwd)?;
 
@@ -1071,6 +1151,149 @@ mod tests {
             assert!(
                 ndef.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8),
                 "{variant:?} value bytes mismatch"
+            );
+        }
+    }
+
+    // ── Protection boundary validation (SFT-7602) ──────────────────
+
+    /// Boundary pages for a variant, paired with whether `enable_protection`
+    /// must accept them. PACK is the last addressable page on every variant,
+    /// so PACK+1 and 0xFF are the disabling values.
+    fn protection_boundaries(v: Variant) -> [(&'static str, u8, bool); 8] {
+        let last_user = v.first_user_page() + v.user_pages() - 1;
+        [
+            ("last user page", last_user, true),
+            ("dynamic lock", v.dynamic_lock_page(), true),
+            ("CFG0", v.cfg0_page(), true),
+            ("CFG1", v.cfg1_page(), true),
+            ("PWD", v.pwd_page(), true),
+            ("PACK", v.pack_page(), true),
+            ("PACK+1", v.pack_page() + 1, false),
+            ("0xFF", 0xFF, false),
+        ]
+    }
+
+    /// A boundary the chip would treat as disabling protection must be
+    /// rejected before any state-changing command, on every variant.
+    #[test]
+    fn enable_protection_rejects_disabling_auth0_with_no_writes() {
+        for (variant, size_field) in VARIANTS {
+            for (name, auth0, valid) in protection_boundaries(variant) {
+                if valid {
+                    continue;
+                }
+                let mut mock = RecordingNtag::new(variant, size_field);
+                {
+                    let mut reader = NtagReader::new(&mut mock);
+                    let res = reader.enable_protection(
+                        variant,
+                        auth0,
+                        [0x11, 0x22, 0x33, 0x44],
+                        [0xAB, 0xCD],
+                        false,
+                    );
+                    assert!(
+                        matches!(
+                            res,
+                            Err(ReaderError::Protocol(Type2Error::InvalidConfiguration))
+                        ),
+                        "{variant:?} {name} ({auth0:#04X}) must be rejected, got {res:?}"
+                    );
+                }
+                assert_eq!(
+                    mock.writes, 0,
+                    "{variant:?} {name}: no state-changing command may be issued"
+                );
+                assert!(
+                    mock.security_untouched(variant),
+                    "{variant:?} {name}: security pages must be untouched"
+                );
+            }
+        }
+    }
+
+    /// Every boundary the chip does honour is accepted and actually written,
+    /// including configuration-only protection.
+    #[test]
+    fn enable_protection_accepts_valid_boundaries() {
+        for (variant, size_field) in VARIANTS {
+            for (name, auth0, valid) in protection_boundaries(variant) {
+                if !valid {
+                    continue;
+                }
+                let mut mock = RecordingNtag::new(variant, size_field);
+                {
+                    let mut reader = NtagReader::new(&mut mock);
+                    reader
+                        .enable_protection(
+                            variant,
+                            auth0,
+                            [0x11, 0x22, 0x33, 0x44],
+                            [0xAB, 0xCD],
+                            false,
+                        )
+                        .unwrap_or_else(|e| panic!("{variant:?} {name} rejected: {e:?}"));
+                    assert_eq!(reader.read_auth0(variant).unwrap(), auth0);
+                }
+                assert!(mock.writes > 0, "{variant:?} {name}: expected writes");
+            }
+        }
+    }
+
+    /// Configuration-only write protection must be reported as enabled. The
+    /// old comparison against the last *user* page reported it as disabled.
+    #[test]
+    fn protection_status_reports_configuration_only_protection() {
+        for (variant, _) in VARIANTS {
+            let mut mock = MockNtagTransceiver::new_ntag216();
+            let cfg0 = variant.cfg0_page() as usize * 4;
+            let cfg1 = variant.cfg1_page() as usize * 4;
+            // AUTH0 at CFG0: protects the configuration pages only.
+            mock.memory[cfg0 + 3] = variant.cfg0_page();
+            mock.memory[cfg1] = 0x00; // PROT = 0 → write-only
+            let mut reader = NtagReader::new(&mut mock);
+            assert_eq!(
+                reader.protection_status(variant).unwrap(),
+                ProtectionStatus::Enabled {
+                    first_protected_page: variant.cfg0_page(),
+                    read_protected: false,
+                },
+                "{variant:?}: configuration-only protection must read as enabled"
+            );
+            assert_eq!(reader.is_protected(variant).unwrap(), Some(false));
+        }
+    }
+
+    /// AUTH0 beyond the last addressable page is genuinely disabled.
+    #[test]
+    fn protection_status_reports_disabled() {
+        for (variant, _) in VARIANTS {
+            let mut mock = MockNtagTransceiver::new_ntag216();
+            let cfg0 = variant.cfg0_page() as usize * 4;
+            mock.memory[cfg0 + 3] = 0xFF;
+            let mut reader = NtagReader::new(&mut mock);
+            assert_eq!(
+                reader.protection_status(variant).unwrap(),
+                ProtectionStatus::Disabled
+            );
+        }
+    }
+
+    /// When the configuration pages are inside a read-protected range, their
+    /// unauthenticated contents cannot be trusted.
+    #[test]
+    fn protection_status_requires_authentication_when_config_read_protected() {
+        for (variant, _) in VARIANTS {
+            let mut mock = MockNtagTransceiver::new_ntag216();
+            let cfg0 = variant.cfg0_page() as usize * 4;
+            let cfg1 = variant.cfg1_page() as usize * 4;
+            mock.memory[cfg0 + 3] = 0x04; // protect from the first user page
+            mock.memory[cfg1] = 0x80; // PROT = 1 → read+write
+            let mut reader = NtagReader::new(&mut mock);
+            assert_eq!(
+                reader.protection_status(variant).unwrap(),
+                ProtectionStatus::AuthenticationRequired
             );
         }
     }
