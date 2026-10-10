@@ -150,9 +150,11 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
     /// 2. FAST_READ only the pages covering the NDEF payload (V)
     ///
     /// This typically requires just 2 RF transactions (1 READ + 1
-    /// FAST_READ) regardless of NDEF size, compared to many READs in
-    /// [`read_ndef`](Self::read_ndef). The CC is read first for
-    /// validation (often a cache hit from a prior operation).
+    /// FAST_READ), compared to many READs in
+    /// [`read_ndef`](Self::read_ndef). A payload longer than the
+    /// transceiver's frame buffer (const generic `N`) takes one FAST_READ
+    /// per `N` bytes. The CC is read first for validation (often a cache
+    /// hit from a prior operation).
     pub fn read_ndef_fast(&mut self, variant: Variant) -> Result<DataVec, ReaderError<T::Error>> {
         let cc = self.read_cc()?;
         if !cc.is_valid() {
@@ -240,8 +242,21 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
         let start_page = u8::try_from(start_page_wide).map_err(|_| Type2Error::OutOfRange)?;
         let end_page = u8::try_from(end_page_wide).map_err(|_| Type2Error::OutOfRange)?;
 
-        // FAST_READ only the pages containing the NDEF data.
-        let raw = self.fast_read(start_page, end_page)?;
+        // FAST_READ only the pages containing the NDEF data, in as many
+        // commands as it takes for each answer to fit one frame.
+        let pages_per_read = u8::try_from(N / 4).unwrap_or(u8::MAX).max(1);
+        let mut raw = DataVec::new();
+        let mut first = start_page;
+        loop {
+            let last = first.saturating_add(pages_per_read - 1).min(end_page);
+            let pages = self.fast_read(first, last)?;
+            nfc_forum_tags::vec::VecExt::try_extend(&mut raw, &pages)
+                .map_err(|_| Type2Error::BufferFull)?;
+            if last == end_page {
+                break;
+            }
+            first = last + 1;
+        }
 
         // Extract just the NDEF bytes (skip page-alignment padding). Prove the
         // response actually contains the full slice before indexing, so a
@@ -1153,6 +1168,34 @@ mod tests {
                 "{variant:?} value bytes mismatch"
             );
         }
+    }
+
+    /// A value longer than one frame comes back through several FAST_READs.
+    #[test]
+    fn read_ndef_fast_splits_reads_at_the_frame_size() {
+        const FRAME_SIZE: usize = 64;
+        struct SmallFrames(MockNtagTransceiver);
+        impl T2TTransceiver<FRAME_SIZE> for SmallFrames {
+            type Error = ();
+
+            fn transceive(&mut self, cmd: &[u8]) -> Result<FrameVec<FRAME_SIZE>, ()> {
+                let answer = self.0.transceive(cmd)?;
+                assert!(answer.len() <= FRAME_SIZE, "{} byte answer", answer.len());
+                let mut frame = FrameVec::new();
+                frame.try_extend(&answer).map_err(|_| ())?;
+                Ok(frame)
+            }
+
+            fn transceive_no_response(&mut self, cmd: &[u8]) -> Result<Option<u8>, ()> {
+                self.0.transceive_no_response(cmd)
+            }
+        }
+
+        let mut mock = SmallFrames(setup_fast_tag(0x6D, 0, 300, true));
+        let mut reader = NtagReader::new(&mut mock);
+        let ndef = reader.read_ndef_fast(Variant::Ntag216).unwrap();
+        assert_eq!(ndef.len(), 300);
+        assert!(ndef.iter().enumerate().all(|(i, &b)| b == (i % 256) as u8));
     }
 
     // ── Protection boundary validation (SFT-7602) ──────────────────
