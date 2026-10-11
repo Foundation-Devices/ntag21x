@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "ntag21x"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "heapless",
  "nfc-forum-tags",
