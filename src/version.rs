@@ -3,7 +3,7 @@
 
 //! GET_VERSION response parsing and NTAG variant identification.
 
-use nfc_forum_tags::type2::Type2Error;
+use nfc_forum_tags::type2::{AccessCondition, CapabilityContainer, Type2Error};
 
 /// NTAG chip variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +87,22 @@ impl Variant {
             Variant::Ntag213 => 0x2C,
             Variant::Ntag215 => 0x86,
             Variant::Ntag216 => 0xE6,
+        }
+    }
+
+    /// Capability Container NXP programs on this variant: version 1.0, no access
+    /// restriction, and a data area that stops short of the user memory end.
+    pub fn capability_container(self) -> CapabilityContainer {
+        CapabilityContainer {
+            version_major: 1,
+            version_minor: 0,
+            size_field: match self {
+                Variant::Ntag213 => 0x12,
+                Variant::Ntag215 => 0x3E,
+                Variant::Ntag216 => 0x6D,
+            },
+            read_access: AccessCondition::Granted,
+            write_access: AccessCondition::Granted,
         }
     }
 }

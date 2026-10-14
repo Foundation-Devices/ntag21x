@@ -36,6 +36,11 @@ pub use version::{Variant, VersionInfo};
 use nfc_forum_tags::type2::{ReaderError, T2TReader, T2TTransceiver, Type2Error};
 use nfc_forum_tags::vec::DataVec;
 
+const CC_PAGE: u8 = 3;
+
+/// An empty NDEF Message TLV, then the Terminator TLV.
+const EMPTY_NDEF_TLV: [u8; 4] = [0x03, 0x00, 0xFE, 0x00];
+
 /// Password-protection status of a tag.
 ///
 /// Distinguishes "protection is off" from "protection is on but its settings
@@ -134,6 +139,20 @@ impl<'t, T: T2TTransceiver<N>, const N: usize> NtagReader<'t, T, N> {
             return Err(Type2Error::OutOfRange.into());
         }
         self.inner.write_ndef(ndef_data)
+    }
+
+    /// Format a blank tag with an empty NDEF message.
+    ///
+    /// The empty NDEF Message TLV goes first and the Capability Container
+    /// last, so an interrupted format leaves the tag as unformatted as it
+    /// was. The CC page is one-time programmable: its bits can only be set.
+    pub fn format(&mut self, variant: Variant) -> Result<(), ReaderError<T::Error>> {
+        self.inner
+            .write(variant.first_user_page(), EMPTY_NDEF_TLV)?;
+        self.inner
+            .write(CC_PAGE, variant.capability_container().to_bytes())?;
+        self.inner.invalidate_cache();
+        Ok(())
     }
 
     /// Set the maximum number of retries on transient transceiver errors.
@@ -922,6 +941,7 @@ mod tests {
     struct RecordingNtag {
         memory: [u8; 924],
         writes: usize,
+        max_writes: usize,
     }
 
     const SENTINEL: [u8; 4] = [0x99, 0x99, 0x99, 0x99];
@@ -931,6 +951,7 @@ mod tests {
             let mut t = RecordingNtag {
                 memory: [0u8; 924],
                 writes: 0,
+                max_writes: usize::MAX,
             };
             // CC (page 3).
             t.memory[12] = 0xE1; // magic
@@ -985,6 +1006,9 @@ mod tests {
                 }
                 Some(0xA2) => {
                     // WRITE
+                    if self.writes == self.max_writes {
+                        return Err(());
+                    }
                     self.writes += 1;
                     let start = cmd[1] as usize * 4;
                     if start + 4 <= self.memory.len() && cmd.len() >= 6 {
@@ -1009,6 +1033,23 @@ mod tests {
         (Variant::Ntag215, 0x3E), // 496-byte data area
         (Variant::Ntag216, 0x6D), // 872-byte data area
     ];
+
+    #[test]
+    fn format_writes_the_cc_last() {
+        for (variant, size_field) in VARIANTS {
+            let mut mock = RecordingNtag::new(variant, size_field);
+            mock.memory[12..20].fill(0);
+            mock.max_writes = 1;
+            assert!(NtagReader::new(&mut mock).format(variant).is_err());
+            assert_eq!(mock.memory[12..16], [0; 4], "{variant:?} CC written early");
+
+            mock.max_writes = usize::MAX;
+            let mut reader = NtagReader::new(&mut mock);
+            reader.format(variant).unwrap();
+            assert!(reader.read_ndef().unwrap().is_empty());
+            assert_eq!(mock.memory[12..16], [0xE1, 0x10, size_field, 0x00]);
+        }
+    }
 
     /// An oversized NDEF write (65,536 bytes) is rejected with a range error
     /// and issues zero writes, leaving the security pages intact.
